@@ -1108,6 +1108,42 @@ def _select_combobox_value(
     return False, observed
 
 
+
+def _series_selection_plan(series_name: str) -> tuple[str, str | None]:
+    """
+    Returnerar (huvudval, konkret serie eller None).
+
+    Exempel:
+    - Pingisligan (dam) -> (Pingisligan (dam), None)
+    - Div 1 N Dam       -> (Division 1 (dam), Div 1 N Dam)
+    - Div 2 NSN         -> (Division 2 (herr), Div 2 NSN)
+    - Division 4B       -> (Division 4, Division 4B)
+    """
+    target = re.sub(r"\s+", " ", series_name).strip()
+
+    direct_national = {
+        "pingisligan (dam)",
+        "pingisligan (herr)",
+        "superettan (dam)",
+        "superettan (herr)",
+    }
+    if target.casefold() in direct_national:
+        return target, None
+
+    national_match = re.match(r"^Div\s+([123])\b", target, re.IGNORECASE)
+    if national_match:
+        division = national_match.group(1)
+        gender = "dam" if re.search(r"\bDam\b", target, re.IGNORECASE) else "herr"
+        return f"Division {division} ({gender})", target
+
+    regional_match = re.match(r"^(Division\s+\d+)", target, re.IGNORECASE)
+    if regional_match:
+        level = regional_match.group(1)
+        return level, None if target.casefold() == level.casefold() else target
+
+    # Okänt format behandlas som ett direkt val i första serierutan.
+    return target, None
+
 def _get_visible_combobox_locators(page: Page):
     """
     Returnerar synliga comboboxar i vänster-till-höger-ordning.
@@ -1379,34 +1415,24 @@ def _click_popup_option_for_box(
 
 def _select_series(page: Page, series_name: str, diagnostics_dir: Path, stamp: str) -> None:
     """
-    Väljer serie i två bestämda steg:
+    Hanterar tre varianter av STUPA:s serieval:
 
-    1. Första divisionsrutan: Division 4, Division 5, ...
-    2. Rutan direkt till höger: Division 4A, Division 4B, ...
+    1. Direkt nationellt val utan undergrupp, t.ex. Pingisligan (dam).
+    2. Nationell division med undergrupp, t.ex. Div 2 SSÖ Dam.
+    3. Regional division med undergrupp, t.ex. Division 4B.
     """
     page.wait_for_timeout(1_000)
     before_url = page.url
 
-    division_level, target_series = _split_series_name(series_name)
+    primary_target, secondary_target = _series_selection_plan(series_name)
 
     diagnostics: dict[str, object] = {
-        "requested_series": target_series,
-        "division_level": division_level,
+        "requested_series": series_name,
+        "primary_target": primary_target,
+        "secondary_target": secondary_target,
         "before_url": before_url,
         "steps": [],
     }
-
-    if target_series.casefold() == division_level.casefold():
-        diagnostics["error"] = "series_name_is_only_level"
-        diagnostics["message"] = (
-            f"Ange en konkret serie, inte bara nivån '{division_level}'. "
-            f"Exempel: '{division_level}A' eller '{division_level}B'."
-        )
-        (diagnostics_dir / f"{stamp}_series_navigation.json").write_text(
-            json.dumps(diagnostics, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        raise ScrapeError(diagnostics["message"])
 
     boxes = _get_visible_combobox_locators(page)
     diagnostics["initial_comboboxes"] = [
@@ -1420,49 +1446,36 @@ def _select_series(page: Page, series_name: str, diagnostics_dir: Path, stamp: s
         for box in boxes
     ]
 
-    # Hitta nivårutan. Den har exakt format "Division N".
-    level_index = next(
+    # Den första serierutan ligger direkt till höger om Teams.
+    teams_index = next(
         (
             index
             for index, box in enumerate(boxes)
-            if re.fullmatch(
-                r"Division\s+\d+",
-                box["text"],
-                re.IGNORECASE,
-            )
+            if box["text"].casefold() == "teams"
         ),
         None,
     )
+    if teams_index is None or teams_index + 1 >= len(boxes):
+        raise ScrapeError("Kunde inte hitta den första serierutan efter 'Teams'.")
 
-    if level_index is None:
-        raise ScrapeError(
-            "Kunde inte hitta rutan för divisionsnivå."
-        )
+    primary_box = boxes[teams_index + 1]
 
-    level_box = boxes[level_index]
-
-    # Byt nivå först, exempelvis Division 4 -> Division 5.
-    if level_box["text"].casefold() != division_level.casefold():
-        ok, options = _click_popup_option_for_box(
-            page,
-            level_box,
-            division_level,
-        )
+    if primary_box["text"].casefold() != primary_target.casefold():
+        ok, options = _click_popup_option_for_box(page, primary_box, primary_target)
         diagnostics["steps"].append(
             {
-                "action": "select_level",
-                "current": level_box["text"],
-                "target": division_level,
+                "action": "select_primary",
+                "current": primary_box["text"],
+                "target": primary_target,
                 "options": options,
                 "success": ok,
             }
         )
-
         if not ok:
             option_names = [str(item.get("text", "")) for item in options]
             raise ScrapeError(
-                f"Kunde inte välja nivån '{division_level}'. "
-                f"Alternativ i nivårutan: {option_names}"
+                f"Kunde inte välja huvudgruppen '{primary_target}'. "
+                f"Alternativ i den första serierutan: {option_names}"
             )
 
         try:
@@ -1471,9 +1484,49 @@ def _select_series(page: Page, series_name: str, diagnostics_dir: Path, stamp: s
             pass
         page.wait_for_timeout(900)
 
-    # Läs om boxarna efter nivåbytet. Rutan direkt till höger är serierutan.
+    # Direktserier har ingen ytterligare serieruta.
+    if secondary_target is None:
+        final_boxes = _get_visible_combobox_locators(page)
+        diagnostics["final_comboboxes"] = [
+            {
+                "text": box["text"],
+                "x": round(box["x"]),
+                "y": round(box["y"]),
+                "width": round(box["width"]),
+                "height": round(box["height"]),
+            }
+            for box in final_boxes
+        ]
+        diagnostics["after_url"] = page.url
+
+        teams_index = next(
+            (
+                index
+                for index, box in enumerate(final_boxes)
+                if box["text"].casefold() == "teams"
+            ),
+            None,
+        )
+        selected_primary = None
+        if teams_index is not None and teams_index + 1 < len(final_boxes):
+            selected_primary = final_boxes[teams_index + 1]["text"]
+
+        if selected_primary is None or selected_primary.casefold() != primary_target.casefold():
+            raise ScrapeError(
+                f"Seriebytet kunde inte verifieras. Förväntade '{primary_target}', "
+                f"men den första serierutan visar '{selected_primary}'."
+            )
+
+        diagnostics["selection_method"] = "direct_primary_series"
+        (diagnostics_dir / f"{stamp}_series_navigation.json").write_text(
+            json.dumps(diagnostics, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return
+
+    # Läs om rutorna efter huvudvalet. Nästa ruta direkt till höger är undergruppen.
     boxes = _get_visible_combobox_locators(page)
-    diagnostics["comboboxes_after_level"] = [
+    diagnostics["comboboxes_after_primary"] = [
         {
             "text": box["text"],
             "x": round(box["x"]),
@@ -1484,50 +1537,42 @@ def _select_series(page: Page, series_name: str, diagnostics_dir: Path, stamp: s
         for box in boxes
     ]
 
-    level_index = next(
+    primary_index = next(
         (
             index
             for index, box in enumerate(boxes)
-            if box["text"].casefold() == division_level.casefold()
+            if box["text"].casefold() == primary_target.casefold()
         ),
         None,
     )
-
-    if level_index is None or level_index + 1 >= len(boxes):
+    if primary_index is None or primary_index + 1 >= len(boxes):
         raise ScrapeError(
-            "Kunde inte hitta serierutan direkt till höger om divisionsnivån."
+            f"Kunde inte hitta undergruppsrutan direkt till höger om '{primary_target}'."
         )
 
-    series_box = boxes[level_index + 1]
-
-    if series_box["text"].casefold() == "group stage":
+    secondary_box = boxes[primary_index + 1]
+    if secondary_box["text"].casefold() == "group stage":
         raise ScrapeError(
-            "Rutan direkt till höger om divisionsnivån var 'Group Stage', "
-            "vilket tyder på att serierutan inte kunde identifieras."
+            f"Ingen undergruppsruta hittades för '{primary_target}'. "
+            "Rutan direkt till höger var 'Group Stage'."
         )
 
-    # Välj konkret serie, exempelvis Division 5B.
-    if series_box["text"].casefold() != target_series.casefold():
-        ok, options = _click_popup_option_for_box(
-            page,
-            series_box,
-            target_series,
-        )
+    if secondary_box["text"].casefold() != secondary_target.casefold():
+        ok, options = _click_popup_option_for_box(page, secondary_box, secondary_target)
         diagnostics["steps"].append(
             {
-                "action": "select_series",
-                "current": series_box["text"],
-                "target": target_series,
+                "action": "select_secondary",
+                "current": secondary_box["text"],
+                "target": secondary_target,
                 "options": options,
                 "success": ok,
             }
         )
-
         if not ok:
             option_names = [str(item.get("text", "")) for item in options]
             raise ScrapeError(
-                f"Kunde inte välja serien '{target_series}'. "
-                f"Alternativ i den andra rutan: {option_names}"
+                f"Kunde inte välja serien '{secondary_target}'. "
+                f"Alternativ i undergruppsrutan: {option_names}"
             )
 
         try:
@@ -1536,7 +1581,6 @@ def _select_series(page: Page, series_name: str, diagnostics_dir: Path, stamp: s
             pass
         page.wait_for_timeout(1_000)
 
-    # Verifiera slutligt val utifrån comboboxarnas aktuella texter.
     final_boxes = _get_visible_combobox_locators(page)
     diagnostics["final_comboboxes"] = [
         {
@@ -1550,27 +1594,25 @@ def _select_series(page: Page, series_name: str, diagnostics_dir: Path, stamp: s
     ]
     diagnostics["after_url"] = page.url
 
-    final_level_index = next(
+    final_primary_index = next(
         (
             index
             for index, box in enumerate(final_boxes)
-            if box["text"].casefold() == division_level.casefold()
+            if box["text"].casefold() == primary_target.casefold()
         ),
         None,
     )
+    selected_secondary = None
+    if final_primary_index is not None and final_primary_index + 1 < len(final_boxes):
+        selected_secondary = final_boxes[final_primary_index + 1]["text"]
 
-    selected_series = None
-    if final_level_index is not None and final_level_index + 1 < len(final_boxes):
-        selected_series = final_boxes[final_level_index + 1]["text"]
-
-    if selected_series is None or selected_series.casefold() != target_series.casefold():
+    if selected_secondary is None or selected_secondary.casefold() != secondary_target.casefold():
         raise ScrapeError(
-            f"Seriebytet kunde inte verifieras. Förväntade '{target_series}', "
-            f"men serierutan visar '{selected_series}'."
+            f"Seriebytet kunde inte verifieras. Förväntade '{secondary_target}', "
+            f"men undergruppsrutan visar '{selected_secondary}'."
         )
 
-    diagnostics["selection_method"] = "level_box_then_adjacent_series_box"
-
+    diagnostics["selection_method"] = "primary_then_secondary"
     (diagnostics_dir / f"{stamp}_series_navigation.json").write_text(
         json.dumps(diagnostics, ensure_ascii=False, indent=2),
         encoding="utf-8",
