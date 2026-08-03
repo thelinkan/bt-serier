@@ -217,32 +217,114 @@ class Database:
         self.connection.commit()
         return self.connection.total_changes - before
 
-    def query_matches(self, organiser: str = "", series_name: str = "") -> list[sqlite3.Row]:
-        return list(self.connection.execute(
-            """
+    def list_seasons(self) -> list[str]:
+        """Return all seasons that currently exist in imported match data."""
+        return [
+            str(row["season"])
+            for row in self.connection.execute(
+                """
+                SELECT DISTINCT season
+                FROM matches
+                WHERE season <> ''
+                ORDER BY season DESC
+                """
+            )
+        ]
+
+    def list_months(self, season: str = "") -> list[int]:
+        """Return months present in match data, ordered July through June."""
+        clauses = [
+            "length(match_date) = 10",
+            "substr(match_date, 5, 1) = '-'",
+            "substr(match_date, 8, 1) = '-'",
+        ]
+        parameters: list[object] = []
+
+        if season:
+            clauses.append("season = ?")
+            parameters.append(season)
+
+        rows = self.connection.execute(
+            f"""
+            SELECT DISTINCT CAST(substr(match_date, 6, 2) AS INTEGER) AS month_number
+            FROM matches
+            WHERE {' AND '.join(clauses)}
+            ORDER BY
+                CASE
+                    WHEN CAST(substr(match_date, 6, 2) AS INTEGER) >= 7
+                        THEN CAST(substr(match_date, 6, 2) AS INTEGER) - 6
+                    ELSE CAST(substr(match_date, 6, 2) AS INTEGER) + 6
+                END
+            """,
+            parameters,
+        )
+
+        return [
+            int(row["month_number"])
+            for row in rows
+            if 1 <= int(row["month_number"]) <= 12
+        ]
+
+    def query_matches(
+        self,
+        organiser: str = "",
+        series_name: str = "",
+        season: str = "",
+        month: int | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses = ["organiser LIKE ?", "series_name LIKE ?"]
+        parameters: list[object] = [
+            f"%{organiser.strip()}%",
+            f"%{series_name.strip()}%",
+        ]
+
+        if season:
+            clauses.append("season = ?")
+            parameters.append(season)
+        if month is not None:
+            clauses.append("substr(match_date, 6, 2) = ?")
+            parameters.append(f"{month:02d}")
+
+        sql = f"""
             SELECT match_date, match_time, series_name, round_name,
                    home_team, away_team, organiser, score, source_url,
                    season, source_type, region
             FROM matches
-            WHERE organiser LIKE ? AND series_name LIKE ?
+            WHERE {' AND '.join(clauses)}
             ORDER BY match_date, match_time, series_name, round_name, organiser
-            """,
-            (f"%{organiser.strip()}%", f"%{series_name.strip()}%"),
-        ))
+        """
+        return list(self.connection.execute(sql, parameters))
 
-    def organiser_summary(self, organiser: str) -> list[sqlite3.Row]:
-        return list(self.connection.execute(
-            """
+    def organiser_summary(
+        self,
+        organiser: str = "",
+        series_name: str = "",
+        season: str = "",
+        month: int | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses = ["organiser LIKE ?", "series_name LIKE ?"]
+        parameters: list[object] = [
+            f"%{organiser.strip()}%",
+            f"%{series_name.strip()}%",
+        ]
+
+        if season:
+            clauses.append("season = ?")
+            parameters.append(season)
+        if month is not None:
+            clauses.append("substr(match_date, 6, 2) = ?")
+            parameters.append(f"{month:02d}")
+
+        sql = f"""
             SELECT match_date, series_name, round_name, organiser,
                    season, source_type, region, COUNT(*) AS match_count
             FROM matches
-            WHERE organiser LIKE ?
+            WHERE {' AND '.join(clauses)}
             GROUP BY match_date, series_name, round_name, organiser,
                      season, source_type, region
             ORDER BY match_date, series_name, round_name
-            """,
-            (f"%{organiser.strip()}%",),
-        ))
+        """
+        return list(self.connection.execute(sql, parameters))
 
     @staticmethod
     def export_csv(rows: list[sqlite3.Row], path: Path) -> None:

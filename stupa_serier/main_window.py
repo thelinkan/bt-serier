@@ -152,6 +152,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.refresh_source_pages()
+        self.refresh_filter_options()
         self.refresh_tables()
 
     def _create_source_pages_tab(self) -> QWidget:
@@ -234,6 +235,14 @@ class MainWindow(QMainWindow):
         self.series_filter.setPlaceholderText("Filtrera på serienamn")
         self.series_filter.textChanged.connect(self.refresh_tables)
 
+        self.season_filter = QComboBox()
+        self.season_filter.currentIndexChanged.connect(
+            self.on_season_filter_changed
+        )
+
+        self.month_filter = QComboBox()
+        self.month_filter.currentIndexChanged.connect(self.refresh_tables)
+
         export_button = QPushButton("Exportera CSV")
         export_button.clicked.connect(self.export_csv)
 
@@ -242,6 +251,10 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(self.organiser_filter, 1)
         filter_row.addWidget(QLabel("Serie:"))
         filter_row.addWidget(self.series_filter, 1)
+        filter_row.addWidget(QLabel("Säsong:"))
+        filter_row.addWidget(self.season_filter)
+        filter_row.addWidget(QLabel("Månad:"))
+        filter_row.addWidget(self.month_filter)
         filter_row.addWidget(export_button)
 
         self.matches_table = QTableWidget()
@@ -412,6 +425,7 @@ class MainWindow(QMainWindow):
         self.update_selected_button.setEnabled(True)
         self.update_all_button.setEnabled(True)
         self.refresh_source_pages()
+        self.refresh_filter_options()
         self.refresh_tables()
         self.status_label.setText(
             f"Uppdateringen klar: {total_records} matcher lästes och "
@@ -430,19 +444,103 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Uppdateringen misslyckades.")
         QMessageBox.critical(self, "Kunde inte uppdatera källsidor", message)
 
+    def refresh_filter_options(self) -> None:
+        """Refresh season and month choices while preserving selections."""
+        if not hasattr(self, "season_filter"):
+            return
+
+        current_season = str(self.season_filter.currentData() or "")
+        self.season_filter.blockSignals(True)
+        self.season_filter.clear()
+        self.season_filter.addItem("Alla säsonger", "")
+        for season in self.database.list_seasons():
+            self.season_filter.addItem(season, season)
+
+        selected_index = self.season_filter.findData(current_season)
+        self.season_filter.setCurrentIndex(
+            selected_index if selected_index >= 0 else 0
+        )
+        self.season_filter.blockSignals(False)
+
+        self.refresh_month_filter()
+
+    def on_season_filter_changed(self) -> None:
+        self.refresh_month_filter()
+        self.refresh_tables()
+
+    def refresh_month_filter(self) -> None:
+        """
+        Show only months present in the database.
+
+        Months follow the table-tennis season order: July through June.
+        When a season is selected, only months in that season are shown.
+        """
+        if not hasattr(self, "month_filter"):
+            return
+
+        month_names = {
+            1: "Januari",
+            2: "Februari",
+            3: "Mars",
+            4: "April",
+            5: "Maj",
+            6: "Juni",
+            7: "Juli",
+            8: "Augusti",
+            9: "September",
+            10: "Oktober",
+            11: "November",
+            12: "December",
+        }
+
+        current_month = self.month_filter.currentData()
+        season = str(self.season_filter.currentData() or "")
+
+        self.month_filter.blockSignals(True)
+        self.month_filter.clear()
+        self.month_filter.addItem("Alla månader", None)
+
+        for month_number in self.database.list_months(season):
+            self.month_filter.addItem(
+                month_names[month_number],
+                month_number,
+            )
+
+        selected_index = self.month_filter.findData(current_month)
+        self.month_filter.setCurrentIndex(
+            selected_index if selected_index >= 0 else 0
+        )
+        self.month_filter.blockSignals(False)
+
     def refresh_tables(self) -> None:
         organiser = self.organiser_filter.text() if hasattr(self, "organiser_filter") else ""
         series_name = self.series_filter.text() if hasattr(self, "series_filter") else ""
-        rows = self.database.query_matches(organiser, series_name)
+        season = (
+            str(self.season_filter.currentData() or "")
+            if hasattr(self, "season_filter")
+            else ""
+        )
+        month = (
+            self.month_filter.currentData()
+            if hasattr(self, "month_filter")
+            else None
+        )
+
+        rows = self.database.query_matches(
+            organiser=organiser,
+            series_name=series_name,
+            season=season,
+            month=month,
+        )
         self.current_rows = rows
         self._fill_table(self.matches_table, rows, self.MATCH_COLUMNS)
 
-        summary_rows = self.database.organiser_summary(organiser)
-        if series_name.strip():
-            summary_rows = [
-                row for row in summary_rows
-                if series_name.casefold() in row["series_name"].casefold()
-            ]
+        summary_rows = self.database.organiser_summary(
+            organiser=organiser,
+            series_name=series_name,
+            season=season,
+            month=month,
+        )
         self._fill_table(self.summary_table, summary_rows, self.SUMMARY_COLUMNS)
 
     @staticmethod
