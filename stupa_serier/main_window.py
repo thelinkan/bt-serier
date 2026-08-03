@@ -4,11 +4,11 @@ import sys
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal, Qt
+from PySide6.QtCore import QThread, Signal, Qt, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -26,7 +27,8 @@ from PySide6.QtWidgets import (
 )
 
 from .database import Database
-from .scraper import ScrapeError, scrape_series
+from .models import SourcePage
+from .scraper import discover_series, scrape_series
 
 
 APP_DIR = Path.cwd()
@@ -35,35 +37,80 @@ DIAGNOSTICS_DIR = APP_DIR / "diagnostics"
 DATA_DIR.mkdir(exist_ok=True)
 
 
-class ScrapeWorker(QThread):
+class SourceUpdateWorker(QThread):
     status_changed = Signal(str)
-    completed = Signal(list)
+    completed = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, url: str, series_name: str) -> None:
+    def __init__(self, source_pages: list[dict]) -> None:
         super().__init__()
-        self.url = url
-        self.series_name = series_name
+        self.source_pages = source_pages
 
     def run(self) -> None:
         try:
-            records = scrape_series(
-                self.url,
-                self.series_name,
-                DIAGNOSTICS_DIR,
-                status=self.status_changed.emit,
-            )
-            self.completed.emit(records)
+            result: list[dict] = []
+            for page_index, source in enumerate(self.source_pages, start=1):
+                prefix = f"Källsida {page_index}/{len(self.source_pages)}: {source['name']}"
+                self.status_changed.emit(f"{prefix} – upptäcker serier…")
+                series_names = discover_series(
+                    source["start_url"],
+                    source["source_type"],
+                    DIAGNOSTICS_DIR,
+                    status=lambda message, p=prefix: self.status_changed.emit(f"{p} – {message}"),
+                )
+                if not series_names:
+                    raise RuntimeError(f"Inga serier hittades på källsidan {source['name']}.")
+
+                page_records = []
+                errors: list[str] = []
+                for series_index, series_name in enumerate(series_names, start=1):
+                    self.status_changed.emit(
+                        f"{prefix} – hämtar {series_name} "
+                        f"({series_index}/{len(series_names)})…"
+                    )
+                    try:
+                        records = scrape_series(
+                            source["start_url"],
+                            series_name,
+                            DIAGNOSTICS_DIR,
+                            status=lambda message, p=prefix, s=series_name: self.status_changed.emit(
+                                f"{p} – {s}: {message}"
+                            ),
+                        )
+                        page_records.extend(records)
+                    except Exception as error:
+                        errors.append(f"{series_name}: {error}")
+
+                result.append(
+                    {
+                        "source": source,
+                        "series_names": series_names,
+                        "records": page_records,
+                        "errors": errors,
+                    }
+                )
+
+            self.completed.emit(result)
         except Exception as error:
-            details = traceback.format_exc()
-            self.failed.emit(f"{error}\n\n{details}")
+            self.failed.emit(f"{error}\n\n{traceback.format_exc()}")
 
 
 class MainWindow(QMainWindow):
+    SOURCE_COLUMNS = [
+        ("Namn", "name"),
+        ("Typ", "source_type"),
+        ("Säsong", "season"),
+        ("Region", "region"),
+        ("Senast uppdaterad", "last_updated_at"),
+        ("Startadress", "start_url"),
+    ]
+
     MATCH_COLUMNS = [
         ("Datum", "match_date"),
         ("Tid", "match_time"),
         ("Serie", "series_name"),
+        ("Säsong", "season"),
+        ("Område", "region"),
         ("Omgång", "round_name"),
         ("Hemma", "home_team"),
         ("Borta", "away_team"),
@@ -74,6 +121,8 @@ class MainWindow(QMainWindow):
     SUMMARY_COLUMNS = [
         ("Datum", "match_date"),
         ("Serie", "series_name"),
+        ("Säsong", "season"),
+        ("Område", "region"),
         ("Omgång", "round_name"),
         ("Arrangör", "organiser"),
         ("Matcher", "match_count"),
@@ -82,72 +131,131 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("STUPA-serier")
-        self.resize(1350, 800)
+        self.resize(1450, 900)
 
         self.database = Database(DATA_DIR / "stupa_serier.sqlite")
         self.current_rows = []
-        self.worker: ScrapeWorker | None = None
+        self.worker: SourceUpdateWorker | None = None
+        self.editing_source_id: int | None = None
 
-        self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText(
-            "Fullständig serieadress, exempel: .../events/435/1186/2/7/7"
-        )
-        self.series_edit = QLineEdit()
-        self.series_edit.setPlaceholderText("Konkret serie, exempel: Division 4B")
+        tabs = QTabWidget()
+        tabs.addTab(self._create_source_pages_tab(), "Källsidor")
+        tabs.addTab(self._create_matches_tab(), "Matcher och arrangörer")
 
-        self.fetch_button = QPushButton("Hämta serie")
-        self.fetch_button.clicked.connect(self.fetch_series)
+        self.status_label = QLabel("Klar.")
+        self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        import_form = QFormLayout()
-        import_form.addRow("Startadress:", self.url_edit)
-        import_form.addRow("Konkret serie:", self.series_edit)
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.addWidget(tabs, 1)
+        layout.addWidget(self.status_label)
+        self.setCentralWidget(central)
 
-        import_row = QHBoxLayout()
-        import_row.addLayout(import_form, 1)
-        import_row.addWidget(self.fetch_button)
+        self.refresh_source_pages()
+        self.refresh_tables()
 
+    def _create_source_pages_tab(self) -> QWidget:
+        self.source_table = QTableWidget()
+        self.source_table.setColumnCount(len(self.SOURCE_COLUMNS))
+        self.source_table.setHorizontalHeaderLabels([label for label, _ in self.SOURCE_COLUMNS])
+        self.source_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.source_table.horizontalHeader().setStretchLastSection(True)
+        self.source_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.source_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.source_table.itemSelectionChanged.connect(self.load_selected_source)
+
+        self.source_name_edit = QLineEdit()
+        self.source_url_edit = QLineEdit()
+        self.source_url_edit.setPlaceholderText("Fullständig fungerande serieadress")
+        self.source_type_combo = QComboBox()
+        self.source_type_combo.addItem("Nationella serier", "national")
+        self.source_type_combo.addItem("Regionala serier", "regional")
+        self.source_type_combo.currentIndexChanged.connect(self.update_region_enabled)
+        self.season_edit = QLineEdit()
+        self.season_edit.setPlaceholderText("Exempel: 2026/2027")
+        self.region_edit = QLineEdit()
+        self.region_edit.setPlaceholderText("Exempel: Nordöstra Svealand")
+
+        form = QFormLayout()
+        form.addRow("Namn:", self.source_name_edit)
+        form.addRow("Startadress:", self.source_url_edit)
+        form.addRow("Typ:", self.source_type_combo)
+        form.addRow("Säsong:", self.season_edit)
+        form.addRow("Region:", self.region_edit)
+
+        self.new_source_button = QPushButton("Ny")
+        self.new_source_button.clicked.connect(self.clear_source_form)
+        self.save_source_button = QPushButton("Spara")
+        self.save_source_button.clicked.connect(self.save_source)
+        self.delete_source_button = QPushButton("Ta bort")
+        self.delete_source_button.clicked.connect(self.delete_source)
+
+        form_buttons = QHBoxLayout()
+        form_buttons.addWidget(self.new_source_button)
+        form_buttons.addWidget(self.save_source_button)
+        form_buttons.addWidget(self.delete_source_button)
+
+        form_widget = QWidget()
+        form_layout = QVBoxLayout(form_widget)
+        form_layout.addLayout(form)
+        form_layout.addLayout(form_buttons)
+        form_layout.addStretch(1)
+
+        splitter = QSplitter()
+        splitter.addWidget(self.source_table)
+        splitter.addWidget(form_widget)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        self.update_selected_button = QPushButton("Uppdatera markerad källsida")
+        self.update_selected_button.clicked.connect(self.update_selected_source)
+        self.update_all_button = QPushButton("Uppdatera alla källsidor")
+        self.update_all_button.clicked.connect(self.update_all_sources)
+        diagnostics_button = QPushButton("Öppna diagnostikmapp")
+        diagnostics_button.clicked.connect(self.open_diagnostics)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.update_selected_button)
+        action_row.addWidget(self.update_all_button)
+        action_row.addStretch(1)
+        action_row.addWidget(diagnostics_button)
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.addWidget(splitter, 1)
+        layout.addLayout(action_row)
+        return widget
+
+    def _create_matches_tab(self) -> QWidget:
         self.organiser_filter = QLineEdit()
         self.organiser_filter.setPlaceholderText("Exempel: Stratos")
         self.organiser_filter.textChanged.connect(self.refresh_tables)
-
         self.series_filter = QLineEdit()
         self.series_filter.setPlaceholderText("Filtrera på serienamn")
         self.series_filter.textChanged.connect(self.refresh_tables)
 
-        self.export_button = QPushButton("Exportera CSV")
-        self.export_button.clicked.connect(self.export_csv)
-
-        self.diagnostics_button = QPushButton("Öppna diagnostikmapp")
-        self.diagnostics_button.clicked.connect(self.open_diagnostics)
+        export_button = QPushButton("Exportera CSV")
+        export_button.clicked.connect(self.export_csv)
 
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("Arrangör:"))
         filter_row.addWidget(self.organiser_filter, 1)
         filter_row.addWidget(QLabel("Serie:"))
         filter_row.addWidget(self.series_filter, 1)
-        filter_row.addWidget(self.export_button)
-        filter_row.addWidget(self.diagnostics_button)
+        filter_row.addWidget(export_button)
 
         self.matches_table = QTableWidget()
         self.matches_table.setColumnCount(len(self.MATCH_COLUMNS))
-        self.matches_table.setHorizontalHeaderLabels(
-            [label for label, _ in self.MATCH_COLUMNS]
-        )
-        self.matches_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeToContents
-        )
+        self.matches_table.setHorizontalHeaderLabels([label for label, _ in self.MATCH_COLUMNS])
+        self.matches_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.matches_table.horizontalHeader().setStretchLastSection(True)
         self.matches_table.setSortingEnabled(True)
         self.matches_table.cellDoubleClicked.connect(self.open_source_url)
 
         self.summary_table = QTableWidget()
         self.summary_table.setColumnCount(len(self.SUMMARY_COLUMNS))
-        self.summary_table.setHorizontalHeaderLabels(
-            [label for label, _ in self.SUMMARY_COLUMNS]
-        )
-        self.summary_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeToContents
-        )
+        self.summary_table.setHorizontalHeaderLabels([label for label, _ in self.SUMMARY_COLUMNS])
+        self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.summary_table.horizontalHeader().setStretchLastSection(True)
         self.summary_table.setSortingEnabled(True)
 
@@ -155,58 +263,176 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.summary_table, "Per seriehelg/omgång")
         tabs.addTab(self.matches_table, "Alla matcher")
 
-        self.status_label = QLabel("Klar.")
-        self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
-        central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.addLayout(import_row)
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
         layout.addLayout(filter_row)
         layout.addWidget(tabs, 1)
-        layout.addWidget(self.status_label)
-        self.setCentralWidget(central)
+        return widget
 
-        self.refresh_tables()
+    def update_region_enabled(self) -> None:
+        regional = self.source_type_combo.currentData() == "regional"
+        self.region_edit.setEnabled(regional)
+        if not regional:
+            self.region_edit.clear()
 
-    def fetch_series(self) -> None:
-        url = self.url_edit.text().strip()
-        series_name = self.series_edit.text().strip()
+    def clear_source_form(self) -> None:
+        self.editing_source_id = None
+        self.source_name_edit.clear()
+        self.source_url_edit.clear()
+        self.source_type_combo.setCurrentIndex(0)
+        self.season_edit.clear()
+        self.region_edit.clear()
+        self.source_table.clearSelection()
+        self.update_region_enabled()
+
+    def save_source(self) -> None:
+        name = self.source_name_edit.text().strip()
+        url = self.source_url_edit.text().strip()
+        source_type = str(self.source_type_combo.currentData())
+        season = self.season_edit.text().strip()
+        region = self.region_edit.text().strip()
+
+        if not name or not url or not season:
+            QMessageBox.warning(self, "Ofullständig källsida", "Namn, startadress och säsong måste anges.")
+            return
         if not url.startswith(("http://", "https://")):
-            QMessageBox.warning(self, "Saknad adress", "Ange en fullständig STUPA-serieadress.")
+            QMessageBox.warning(self, "Felaktig adress", "Ange en fullständig webbadress.")
             return
-        if not series_name:
-            QMessageBox.warning(self, "Saknat serienamn", "Ange seriens namn.")
+        if source_type == "regional" and not region:
+            QMessageBox.warning(self, "Saknad region", "Regionala källsidor måste ha en region.")
             return
 
-        self.fetch_button.setEnabled(False)
-        self.worker = ScrapeWorker(url, series_name)
+        try:
+            page_id = self.database.save_source_page(SourcePage(
+                id=self.editing_source_id,
+                name=name,
+                start_url=url,
+                source_type=source_type,
+                season=season,
+                region=region,
+            ))
+        except Exception as error:
+            QMessageBox.critical(self, "Kunde inte spara", str(error))
+            return
+
+        self.editing_source_id = page_id
+        self.refresh_source_pages(select_id=page_id)
+        self.status_label.setText(f"Källsidan '{name}' sparades.")
+
+    def delete_source(self) -> None:
+        if self.editing_source_id is None:
+            return
+        if QMessageBox.question(self, "Ta bort källsida", "Ta bort den markerade källsidan?") != QMessageBox.Yes:
+            return
+        self.database.delete_source_page(self.editing_source_id)
+        self.clear_source_form()
+        self.refresh_source_pages()
+
+    def refresh_source_pages(self, select_id: int | None = None) -> None:
+        rows = self.database.list_source_pages()
+        self.source_table.setRowCount(len(rows))
+        selected_row = None
+        for row_index, row in enumerate(rows):
+            for column_index, (_, field) in enumerate(self.SOURCE_COLUMNS):
+                value = row[field] or ""
+                if field == "source_type":
+                    value = "Nationell" if value == "national" else "Regional"
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.UserRole, row["id"])
+                self.source_table.setItem(row_index, column_index, item)
+            if select_id == row["id"]:
+                selected_row = row_index
+        if selected_row is not None:
+            self.source_table.selectRow(selected_row)
+
+    def selected_source_id(self) -> int | None:
+        row = self.source_table.currentRow()
+        if row < 0:
+            return None
+        item = self.source_table.item(row, 0)
+        return int(item.data(Qt.UserRole)) if item else None
+
+    def load_selected_source(self) -> None:
+        source_id = self.selected_source_id()
+        if source_id is None:
+            return
+        row = self.database.get_source_page(source_id)
+        if row is None:
+            return
+        self.editing_source_id = source_id
+        self.source_name_edit.setText(row["name"])
+        self.source_url_edit.setText(row["start_url"])
+        self.source_type_combo.setCurrentIndex(0 if row["source_type"] == "national" else 1)
+        self.season_edit.setText(row["season"])
+        self.region_edit.setText(row["region"] or "")
+        self.update_region_enabled()
+
+    @staticmethod
+    def row_to_dict(row) -> dict:
+        return {key: row[key] for key in row.keys()}
+
+    def update_selected_source(self) -> None:
+        source_id = self.selected_source_id()
+        if source_id is None:
+            QMessageBox.information(self, "Ingen källsida", "Markera en källsida först.")
+            return
+        row = self.database.get_source_page(source_id)
+        if row:
+            self.start_source_update([self.row_to_dict(row)])
+
+    def update_all_sources(self) -> None:
+        rows = self.database.list_source_pages()
+        if not rows:
+            QMessageBox.information(self, "Inga källsidor", "Lägg först upp minst en källsida.")
+            return
+        self.start_source_update([self.row_to_dict(row) for row in rows])
+
+    def start_source_update(self, sources: list[dict]) -> None:
+        self.update_selected_button.setEnabled(False)
+        self.update_all_button.setEnabled(False)
+        self.worker = SourceUpdateWorker(sources)
         self.worker.status_changed.connect(self.status_label.setText)
-        self.worker.completed.connect(self.scrape_completed)
-        self.worker.failed.connect(self.scrape_failed)
+        self.worker.completed.connect(self.source_update_completed)
+        self.worker.failed.connect(self.source_update_failed)
         self.worker.start()
 
-    def scrape_completed(self, records: list) -> None:
-        changes = self.database.upsert_matches(records)
-        self.status_label.setText(
-            f"Hämtningen klar: {len(records)} matcher lästes, "
-            f"{changes} databasändringar."
-        )
-        self.fetch_button.setEnabled(True)
-        self.refresh_tables()
+    def source_update_completed(self, result: list[dict]) -> None:
+        total_records = 0
+        total_changes = 0
+        errors: list[str] = []
+        for page_result in result:
+            source = page_result["source"]
+            source_row = self.database.get_source_page(int(source["id"]))
+            records = page_result["records"]
+            total_records += len(records)
+            total_changes += self.database.upsert_matches(records, source_row)
+            self.database.mark_source_page_updated(int(source["id"]))
+            errors.extend(f"{source['name']} – {message}" for message in page_result["errors"])
 
-    def scrape_failed(self, message: str) -> None:
-        self.fetch_button.setEnabled(True)
-        self.status_label.setText("Hämtningen misslyckades.")
-        QMessageBox.critical(
-            self,
-            "Kunde inte hämta serien",
-            message,
+        self.update_selected_button.setEnabled(True)
+        self.update_all_button.setEnabled(True)
+        self.refresh_source_pages()
+        self.refresh_tables()
+        self.status_label.setText(
+            f"Uppdateringen klar: {total_records} matcher lästes och "
+            f"{total_changes} databasändringar gjordes."
         )
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Uppdateringen slutfördes med fel",
+                "\n\n".join(errors[:20]),
+            )
+
+    def source_update_failed(self, message: str) -> None:
+        self.update_selected_button.setEnabled(True)
+        self.update_all_button.setEnabled(True)
+        self.status_label.setText("Uppdateringen misslyckades.")
+        QMessageBox.critical(self, "Kunde inte uppdatera källsidor", message)
 
     def refresh_tables(self) -> None:
-        organiser = self.organiser_filter.text()
-        series_name = self.series_filter.text()
-
+        organiser = self.organiser_filter.text() if hasattr(self, "organiser_filter") else ""
+        series_name = self.series_filter.text() if hasattr(self, "series_filter") else ""
         rows = self.database.query_matches(organiser, series_name)
         self.current_rows = rows
         self._fill_table(self.matches_table, rows, self.MATCH_COLUMNS)
@@ -214,15 +440,10 @@ class MainWindow(QMainWindow):
         summary_rows = self.database.organiser_summary(organiser)
         if series_name.strip():
             summary_rows = [
-                row
-                for row in summary_rows
+                row for row in summary_rows
                 if series_name.casefold() in row["series_name"].casefold()
             ]
         self._fill_table(self.summary_table, summary_rows, self.SUMMARY_COLUMNS)
-
-        self.status_label.setText(
-            f"Visar {len(rows)} matcher och {len(summary_rows)} sammanfattningsrader."
-        )
 
     @staticmethod
     def _fill_table(table, rows, columns) -> None:
@@ -243,17 +464,11 @@ class MainWindow(QMainWindow):
         if not self.current_rows:
             QMessageBox.information(self, "Inget att exportera", "Filtret gav inga rader.")
             return
-
         filename, _ = QFileDialog.getSaveFileName(
-            self,
-            "Exportera matcher",
-            "stupa_matcher.csv",
-            "CSV-filer (*.csv)",
+            self, "Exportera matcher", "stupa_matcher.csv", "CSV-filer (*.csv)"
         )
-        if not filename:
-            return
-        self.database.export_csv(self.current_rows, Path(filename))
-        self.status_label.setText(f"Exporterade {len(self.current_rows)} matcher.")
+        if filename:
+            self.database.export_csv(self.current_rows, Path(filename))
 
     def open_diagnostics(self) -> None:
         DIAGNOSTICS_DIR.mkdir(exist_ok=True)
@@ -261,11 +476,8 @@ class MainWindow(QMainWindow):
 
     def open_source_url(self, row: int, _column: int) -> None:
         item = self.matches_table.item(row, 0)
-        if not item:
-            return
-        url = item.data(Qt.UserRole)
-        if url:
-            QDesktopServices.openUrl(QUrl(url))
+        if item and item.data(Qt.UserRole):
+            QDesktopServices.openUrl(QUrl(str(item.data(Qt.UserRole))))
 
 
 def run() -> None:

@@ -1742,3 +1742,142 @@ def scrape_series(
 
         finally:
             browser.close()
+
+
+def discover_series(
+    url: str,
+    source_type: str,
+    diagnostics_dir: Path,
+    status: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Upptäck alla konkreta serier som kan väljas från en STUPA-källsida."""
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def report(message: str) -> None:
+        if status:
+            status(message)
+
+    def load_page(page: Page) -> None:
+        page.goto(_start_url(url), wait_until="domcontentloaded", timeout=60_000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=20_000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1_000)
+
+    def clean_option_names(options: list[dict[str, object]]) -> list[str]:
+        names: list[str] = []
+        for option in options:
+            name = re.sub(r"\s+", " ", str(option.get("text", ""))).strip()
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    found: list[str] = []
+    details: list[dict[str, object]] = []
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1600, "height": 1000})
+        try:
+            report("Öppnar källsidan och läser huvudgrupper…")
+            load_page(page)
+            boxes = _get_visible_combobox_locators(page)
+            if len(boxes) < 2:
+                raise ScrapeError("Kunde inte hitta huvudväljaren för serier.")
+            main_box = boxes[1]
+            main_box["locator"].click(timeout=3_000)
+            page.wait_for_timeout(400)
+            main_options = clean_option_names(_popup_options_for_box(page, main_box))
+            page.keyboard.press("Escape")
+
+            if source_type == "national":
+                groups = [
+                    name for name in main_options
+                    if name.casefold().startswith(("pingisligan", "superettan", "division "))
+                ]
+            else:
+                groups = [
+                    name for name in main_options
+                    if re.fullmatch(r"Division\s+\d+", name, re.IGNORECASE)
+                ]
+
+            if not groups:
+                raise ScrapeError(
+                    f"Inga seriegrupper hittades. Huvudalternativ: {main_options}"
+                )
+
+            for index, group in enumerate(groups, start=1):
+                report(f"Kartlägger {group} ({index} av {len(groups)})…")
+
+                # Nationella toppligor är själva konkreta serien.
+                if source_type == "national" and group.casefold().startswith(
+                    ("pingisligan", "superettan")
+                ):
+                    if group not in found:
+                        found.append(group)
+                    details.append({"group": group, "series": [group]})
+                    continue
+
+                load_page(page)
+                boxes = _get_visible_combobox_locators(page)
+                if len(boxes) < 2:
+                    continue
+                current_main = boxes[1]
+                ok, options = _click_popup_option_for_box(page, current_main, group)
+                if not ok:
+                    details.append({"group": group, "error": "kunde inte väljas", "options": options})
+                    continue
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10_000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(800)
+
+                boxes = _get_visible_combobox_locators(page)
+                if len(boxes) < 3:
+                    # Om ingen andra ruta finns är gruppen själv en konkret serie.
+                    if group not in found:
+                        found.append(group)
+                    details.append({"group": group, "series": [group]})
+                    continue
+
+                second_box = boxes[2]
+                second_box["locator"].click(timeout=3_000)
+                page.wait_for_timeout(400)
+                second_options = clean_option_names(_popup_options_for_box(page, second_box))
+                page.keyboard.press("Escape")
+
+                concrete = [
+                    name for name in second_options
+                    if name.casefold() != "group stage"
+                    and (
+                        name.casefold().startswith("div ")
+                        or name.casefold().startswith("division ")
+                    )
+                ]
+                for name in concrete:
+                    if name not in found:
+                        found.append(name)
+                details.append({"group": group, "series": concrete, "raw_options": second_options})
+
+            (diagnostics_dir / f"{stamp}_source_discovery.json").write_text(
+                json.dumps(
+                    {
+                        "url": url,
+                        "source_type": source_type,
+                        "main_options": main_options,
+                        "groups": groups,
+                        "series": found,
+                        "details": details,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        finally:
+            browser.close()
+
+    return found

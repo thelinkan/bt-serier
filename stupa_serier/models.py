@@ -12,3 +12,14 @@ class MatchRecord:
     away_team: str
     organiser: str
     score: str
+
+
+@dataclass(slots=True)
+class SourcePage:
+    id: int | None
+    name: str
+    start_url: str
+    source_type: str
+    season: str
+    region: str
+    last_updated_at: str | None = None
