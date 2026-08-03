@@ -1,0 +1,76 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtuella miljöer
+.venv/
+venv/
+env/
+ENV/
+
+# Python-paket och byggfiler
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test- och analyscache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE-inställningar
+.vscode/
+.idea/
+*.code-workspace
+
+# Operativsystem
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Loggar
+*.log
+
+# Programmets lokala databas
+data/*.sqlite
+data/*.sqlite3
+data/*.db
+
+# SQLite temporära filer
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Diagnostik från STUPA-skrapningen
+diagnostics/
+screenshots/
+
+# Exporterade filer
+exports/
+*.csv
+*.xlsx
+
+# Playwright
+playwright-report/
+test-results/
+blob-report/
+.auth/
+
+# Tillfälliga filer
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# cx_Freeze / PyInstaller
+*.spec
