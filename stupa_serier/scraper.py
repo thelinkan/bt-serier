@@ -18,6 +18,42 @@ SCORE_RE = re.compile(r"\b\d+\s*-\s*\d+\b")
 ROUND_RE = re.compile(r"^Round\s+\d+$", re.IGNORECASE)
 
 
+def _normalize_match_date(value: str) -> str:
+    """Convert STUPA dates to ISO format YYYY-MM-DD.
+
+    Supported source formats include DD-MM-YY, DD-MM-YYYY and the same
+    forms with slash or dot separators. Existing ISO dates pass through.
+    Two-digit years are interpreted as 2000-2099, matching the seasons
+    represented by the current STUPA data.
+    """
+    cleaned = value.strip()
+
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned):
+        return cleaned
+
+    match = re.fullmatch(
+        r"(?P<day>\d{2})[-/.](?P<month>\d{2})[-/.](?P<year>\d{2}|\d{4})",
+        cleaned,
+    )
+    if not match:
+        return cleaned
+
+    year = int(match.group("year"))
+    if year < 100:
+        year += 2000
+
+    try:
+        parsed = datetime(
+            year,
+            int(match.group("month")),
+            int(match.group("day")),
+        )
+    except ValueError:
+        return cleaned
+
+    return parsed.strftime("%Y-%m-%d")
+
+
 class ScrapeError(RuntimeError):
     pass
 
@@ -326,7 +362,7 @@ def _parse_row(
     if date_index is None or time_index is None:
         return None
 
-    match_date = lines[date_index]
+    match_date = _normalize_match_date(lines[date_index])
     match_time = lines[time_index]
 
     score_index = next(
@@ -420,7 +456,7 @@ def _parse_body_text(
             if i + 6 >= len(section):
                 break
 
-            match_date = section[i]
+            match_date = _normalize_match_date(section[i])
             match_time = section[i + 1] if TIME_RE.fullmatch(section[i + 1]) else ""
 
             if not match_time:

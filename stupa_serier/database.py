@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -79,6 +80,37 @@ class Database:
             if column not in columns:
                 self.connection.execute(sql)
         self.connection.commit()
+        self._normalize_existing_match_dates()
+
+    def _normalize_existing_match_dates(self) -> None:
+        """Convert legacy DD-MM-YY/DD-MM-YYYY dates already stored in SQLite."""
+        rows = self.connection.execute(
+            "SELECT id, match_date FROM matches WHERE match_date <> ''"
+        ).fetchall()
+
+        updates: list[tuple[str, int]] = []
+        for row in rows:
+            value = str(row["match_date"]).strip()
+            if len(value) == 10 and value[4] == "-" and value[7] == "-":
+                continue
+
+            normalized = value
+            for format_string in ("%d-%m-%y", "%d-%m-%Y", "%d/%m/%y", "%d/%m/%Y", "%d.%m.%y", "%d.%m.%Y"):
+                try:
+                    normalized = datetime.strptime(value, format_string).strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    continue
+
+            if normalized != value:
+                updates.append((normalized, int(row["id"])))
+
+        if updates:
+            self.connection.executemany(
+                "UPDATE matches SET match_date = ? WHERE id = ?",
+                updates,
+            )
+            self.connection.commit()
 
     def list_source_pages(self) -> list[sqlite3.Row]:
         return list(self.connection.execute(
