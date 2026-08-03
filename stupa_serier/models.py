@@ -12,6 +12,8 @@ class MatchRecord:
     away_team: str
     organiser: str
     score: str
+    home_club: str = ""
+    away_club: str = ""
 
 
 @dataclass(slots=True)

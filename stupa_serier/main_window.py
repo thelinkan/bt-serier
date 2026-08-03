@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -118,6 +120,13 @@ class MainWindow(QMainWindow):
         ("Resultat", "score"),
     ]
 
+    TEAM_COLUMNS = [
+        ("Lag", "team_name"),
+        ("Serie", "series_name"),
+        ("Typ", "source_type"),
+        ("Region", "region"),
+    ]
+
     SUMMARY_COLUMNS = [
         ("Datum", "match_date"),
         ("Serie", "series_name"),
@@ -141,6 +150,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._create_source_pages_tab(), "Källsidor")
         tabs.addTab(self._create_matches_tab(), "Matcher och arrangörer")
+        tabs.addTab(self._create_clubs_teams_tab(), "Förening och lag")
 
         self.status_label = QLabel("Klar.")
         self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -154,6 +164,7 @@ class MainWindow(QMainWindow):
         self.refresh_source_pages()
         self.refresh_filter_options()
         self.refresh_tables()
+        self.refresh_club_season_options()
 
     def _create_source_pages_tab(self) -> QWidget:
         self.source_table = QTableWidget()
@@ -280,6 +291,54 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(widget)
         layout.addLayout(filter_row)
         layout.addWidget(tabs, 1)
+        return widget
+
+    def _create_clubs_teams_tab(self) -> QWidget:
+        self.club_season_filter = QComboBox()
+        self.club_season_filter.currentIndexChanged.connect(
+            self.on_club_season_changed
+        )
+
+        self.club_list = QListWidget()
+        self.club_list.setSortingEnabled(False)
+        self.club_list.currentItemChanged.connect(
+            self.on_selected_club_changed
+        )
+
+        self.club_team_table = QTableWidget()
+        self.club_team_table.setColumnCount(len(self.TEAM_COLUMNS))
+        self.club_team_table.setHorizontalHeaderLabels(
+            [label for label, _ in self.TEAM_COLUMNS]
+        )
+        self.club_team_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self.club_team_table.horizontalHeader().setStretchLastSection(True)
+        self.club_team_table.setSortingEnabled(True)
+
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.addWidget(QLabel("Säsong:"))
+        left_layout.addWidget(self.club_season_filter)
+        left_layout.addWidget(QLabel("Föreningar:"))
+        left_layout.addWidget(self.club_list, 1)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        self.selected_club_label = QLabel("Välj en förening")
+        right_layout.addWidget(self.selected_club_label)
+        right_layout.addWidget(self.club_team_table, 1)
+
+        splitter = QSplitter()
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([350, 1000])
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.addWidget(splitter, 1)
         return widget
 
     def update_region_enabled(self) -> None:
@@ -427,6 +486,7 @@ class MainWindow(QMainWindow):
         self.refresh_source_pages()
         self.refresh_filter_options()
         self.refresh_tables()
+        self.refresh_club_season_options()
         self.status_label.setText(
             f"Uppdateringen klar: {total_records} matcher lästes och "
             f"{total_changes} databasändringar gjordes."
@@ -443,6 +503,92 @@ class MainWindow(QMainWindow):
         self.update_all_button.setEnabled(True)
         self.status_label.setText("Uppdateringen misslyckades.")
         QMessageBox.critical(self, "Kunde inte uppdatera källsidor", message)
+
+    def refresh_club_season_options(self) -> None:
+        """
+        Refresh the mandatory season selector for the club/team tab.
+
+        There is deliberately no "all seasons" choice because team names and
+        affiliations may differ between seasons.
+        """
+        if not hasattr(self, "club_season_filter"):
+            return
+
+        current = str(self.club_season_filter.currentData() or "")
+        seasons = self.database.list_seasons()
+
+        self.club_season_filter.blockSignals(True)
+        self.club_season_filter.clear()
+
+        for season in seasons:
+            self.club_season_filter.addItem(season, season)
+
+        selected_index = self.club_season_filter.findData(current)
+        if selected_index < 0 and seasons:
+            selected_index = 0
+        self.club_season_filter.setCurrentIndex(selected_index)
+        self.club_season_filter.blockSignals(False)
+
+        self.refresh_club_list()
+
+    def on_club_season_changed(self) -> None:
+        self.refresh_club_list()
+
+    def refresh_club_list(self) -> None:
+        if not hasattr(self, "club_list"):
+            return
+
+        current_club = (
+            self.club_list.currentItem().text()
+            if self.club_list.currentItem()
+            else ""
+        )
+        season = str(self.club_season_filter.currentData() or "")
+
+        self.club_list.blockSignals(True)
+        self.club_list.clear()
+        for club in self.database.list_clubs(season):
+            self.club_list.addItem(QListWidgetItem(club))
+
+        matching_items = self.club_list.findItems(
+            current_club,
+            Qt.MatchExactly,
+        ) if current_club else []
+
+        if matching_items:
+            self.club_list.setCurrentItem(matching_items[0])
+        elif self.club_list.count() > 0:
+            self.club_list.setCurrentRow(0)
+
+        self.club_list.blockSignals(False)
+        self.refresh_selected_club()
+
+    def on_selected_club_changed(self, _current=None, _previous=None) -> None:
+        self.refresh_selected_club()
+
+    def refresh_selected_club(self) -> None:
+        if not hasattr(self, "club_team_table"):
+            return
+
+        season = str(self.club_season_filter.currentData() or "")
+        item = self.club_list.currentItem()
+        club = item.text() if item else ""
+
+        if not season:
+            self.selected_club_label.setText("Ingen importerad säsong finns")
+            self._fill_table(self.club_team_table, [], self.TEAM_COLUMNS)
+            return
+
+        if not club:
+            self.selected_club_label.setText(
+                f"Inga föreningar finns för säsongen {season}"
+            )
+            self._fill_table(self.club_team_table, [], self.TEAM_COLUMNS)
+            return
+
+        self.selected_club_label.setText(f"{club} – säsong {season}")
+        rows = self.database.list_teams_for_club(season, club)
+        self._fill_table(self.club_team_table, rows, self.TEAM_COLUMNS)
 
     def refresh_filter_options(self) -> None:
         """Refresh season and month choices while preserving selections."""

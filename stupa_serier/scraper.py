@@ -1654,6 +1654,63 @@ def _select_series(page: Page, series_name: str, diagnostics_dir: Path, stamp: s
         encoding="utf-8",
     )
 
+
+def _extract_team_clubs(
+    body_text: str,
+    records: list[MatchRecord],
+) -> dict[str, str]:
+    """
+    Extract the Team Leaderboard mapping from the visible page text.
+
+    STUPA shows Team Name and Club before the match rounds. We use the already
+    parsed team names as anchors, which is more stable than relying on a fixed
+    number of statistical columns in the leaderboard.
+    """
+    lines = _clean_lines(body_text)
+    try:
+        filter_index = next(
+            index for index, value in enumerate(lines)
+            if value.casefold() == "filter"
+        )
+    except StopIteration:
+        filter_index = len(lines)
+
+    leaderboard_lines = lines[:filter_index]
+    team_names = sorted(
+        {
+            record.home_team
+            for record in records
+            if record.home_team
+        }
+        | {
+            record.away_team
+            for record in records
+            if record.away_team
+        },
+        key=len,
+        reverse=True,
+    )
+
+    mapping: dict[str, str] = {}
+    for team_name in team_names:
+        for index, value in enumerate(leaderboard_lines[:-1]):
+            if value.casefold() != team_name.casefold():
+                continue
+
+            club = leaderboard_lines[index + 1].strip()
+            if (
+                club
+                and club.casefold() not in {
+                    "tm", "w", "t", "l", "sm", "set", "pts",
+                    "team name", "club",
+                }
+                and not re.fullmatch(r"-?\d+(?:-\d+)?", club)
+            ):
+                mapping[team_name] = club
+                break
+
+    return mapping
+
 def scrape_series(
     url: str,
     series_name: str,
@@ -1714,6 +1771,16 @@ def scrape_series(
                 body_text,
                 source_url=page.url,
                 series_name=series_name,
+            )
+
+            team_clubs = _extract_team_clubs(body_text, parsed)
+            for record in parsed:
+                record.home_club = team_clubs.get(record.home_team, "")
+                record.away_club = team_clubs.get(record.away_team, "")
+
+            (diagnostics_dir / f"{stamp}_team_clubs.json").write_text(
+                json.dumps(team_clubs, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
 
             report("Sparar diagnostik…")

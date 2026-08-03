@@ -1,12 +1,112 @@
 from __future__ import annotations
 
 import csv
+import re
 import sqlite3
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
 from .models import MatchRecord, SourcePage
+
+
+_CLUB_WORD_REPLACEMENTS = (
+    (r"\bbordtennisklubb\b", "btk"),
+    (r"\bbordtennisförening\b", "btf"),
+    (r"\bbordtennisforening\b", "btf"),
+    (r"\bbordtennis\b", "bt"),
+    (r"\bpingisklubb\b", "pk"),
+    (r"\bsportklubb\b", "sk"),
+    (r"\bidrottsförening\b", "if"),
+    (r"\bidrottsforening\b", "if"),
+    (r"\bidrottsklubb\b", "ik"),
+    (r"\bgymnastikförening\b", "gf"),
+    (r"\bgymnastikforening\b", "gf"),
+    (r"\ballmänna idrottsklubb\b", "aik"),
+    (r"\ballmanna idrottsklubb\b", "aik"),
+)
+
+
+def _fold_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(
+        character
+        for character in normalized
+        if not unicodedata.combining(character)
+    )
+
+
+def _club_key(value: str) -> str:
+    """
+    Return a comparison key for club-name variants.
+
+    Full organization words are reduced to the abbreviations commonly used
+    in team names before punctuation and whitespace are removed.
+    """
+    text = _fold_text(value)
+    text = text.replace("&", " och ")
+
+    for pattern, replacement in _CLUB_WORD_REPLACEMENTS:
+        text = re.sub(pattern, replacement, text)
+
+    text = re.sub(r"\boch\b", "", text)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _derived_club_name(team_name: str) -> str:
+    """
+    Remove the team designation from a STUPA team name.
+
+    Examples:
+      "Umeå BTK: A1" -> "Umeå BTK"
+      "Gefle PK C" -> "Gefle PK"
+      "IK Sirius BTK D1" -> "IK Sirius BTK"
+      "Örbyhus IF" -> "Örbyhus IF"
+    """
+    value = re.sub(r"\s+", " ", team_name).strip()
+
+    if ":" in value:
+        value = value.rsplit(":", 1)[0].strip()
+
+    parts = value.split()
+    if len(parts) < 2:
+        return value
+
+    final = parts[-1]
+    protected_abbreviations = {
+        "BTK", "BT", "BTF", "PK", "SK", "IF", "IK", "AIK", "GIF",
+        "KFUM", "SISU", "IS", "BK", "FF", "GF",
+    }
+
+    # Team designations are normally A, B, C, A1, D1, F15 and similar.
+    if (
+        final.upper() not in protected_abbreviations
+        and re.fullmatch(r"[A-ZÅÄÖ]{1,3}\d{0,2}", final, re.IGNORECASE)
+    ):
+        value = " ".join(parts[:-1]).strip()
+
+    return value
+
+
+def _display_choice(
+    existing: tuple[int, str] | None,
+    priority: int,
+    candidate: str,
+) -> tuple[int, str]:
+    """
+    Keep the highest-priority display name.
+
+    Priority:
+      3 arranger name
+      2 explicit club name from STUPA
+      1 name derived from a team
+    """
+    if existing is None or priority > existing[0]:
+        return priority, candidate
+    if priority == existing[0] and candidate.casefold() < existing[1].casefold():
+        return priority, candidate
+    return existing
 
 
 class Database:
@@ -47,6 +147,8 @@ class Database:
                 match_time TEXT NOT NULL DEFAULT '',
                 home_team TEXT NOT NULL DEFAULT '',
                 away_team TEXT NOT NULL DEFAULT '',
+                home_club TEXT NOT NULL DEFAULT '',
+                away_club TEXT NOT NULL DEFAULT '',
                 organiser TEXT NOT NULL DEFAULT '',
                 score TEXT NOT NULL DEFAULT '',
                 source_page_id INTEGER REFERENCES source_pages(id),
@@ -75,6 +177,8 @@ class Database:
             "season": "ALTER TABLE matches ADD COLUMN season TEXT NOT NULL DEFAULT ''",
             "source_type": "ALTER TABLE matches ADD COLUMN source_type TEXT NOT NULL DEFAULT ''",
             "region": "ALTER TABLE matches ADD COLUMN region TEXT NOT NULL DEFAULT ''",
+            "home_club": "ALTER TABLE matches ADD COLUMN home_club TEXT NOT NULL DEFAULT ''",
+            "away_club": "ALTER TABLE matches ADD COLUMN away_club TEXT NOT NULL DEFAULT ''",
         }
         for column, sql in migrations.items():
             if column not in columns:
@@ -188,16 +292,18 @@ class Database:
             """
             INSERT INTO matches (
                 source_url, series_name, round_name, match_date, match_time,
-                home_team, away_team, organiser, score,
+                home_team, away_team, home_club, away_club, organiser, score,
                 source_page_id, season, source_type, region
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (
                 source_url, series_name, round_name, match_date, match_time,
                 home_team, away_team, organiser
             )
             DO UPDATE SET
                 score = excluded.score,
+                home_club = excluded.home_club,
+                away_club = excluded.away_club,
                 source_page_id = excluded.source_page_id,
                 season = excluded.season,
                 source_type = excluded.source_type,
@@ -208,7 +314,8 @@ class Database:
                 (
                     item.source_url, item.series_name, item.round_name,
                     item.match_date, item.match_time, item.home_team,
-                    item.away_team, item.organiser, item.score,
+                    item.away_team, item.home_club, item.away_club,
+                    item.organiser, item.score,
                     source_page_id, season, source_type, region,
                 )
                 for item in matches
@@ -264,6 +371,125 @@ class Database:
             for row in rows
             if 1 <= int(row["month_number"]) <= 12
         ]
+
+    def _club_team_index(
+        self,
+        season: str,
+    ) -> tuple[list[str], dict[str, list[dict[str, str]]]]:
+        """
+        Build a season-specific club registry from teams and organisers.
+
+        Organiser names are treated as the preferred canonical display names.
+        Team-derived abbreviations are matched to those names through _club_key.
+        """
+        if not season:
+            return [], {}
+
+        rows = list(
+            self.connection.execute(
+                """
+                SELECT
+                    home_team,
+                    away_team,
+                    home_club,
+                    away_club,
+                    organiser,
+                    series_name,
+                    source_type,
+                    region
+                FROM matches
+                WHERE season = ?
+                """,
+                (season,),
+            )
+        )
+
+        canonical_by_key: dict[str, tuple[int, str]] = {}
+
+        # First collect all possible club names, with organisers having the
+        # highest priority as the canonical display form.
+        for row in rows:
+            candidates = (
+                (3, str(row["organiser"] or "").strip()),
+                (2, str(row["home_club"] or "").strip()),
+                (2, str(row["away_club"] or "").strip()),
+                (1, _derived_club_name(str(row["home_team"] or ""))),
+                (1, _derived_club_name(str(row["away_team"] or ""))),
+            )
+
+            for priority, candidate in candidates:
+                if not candidate:
+                    continue
+                key = _club_key(candidate)
+                if not key:
+                    continue
+                canonical_by_key[key] = _display_choice(
+                    canonical_by_key.get(key),
+                    priority,
+                    candidate,
+                )
+
+        teams_by_club: dict[str, dict[tuple[str, str, str, str], dict[str, str]]] = {}
+
+        for row in rows:
+            for side in ("home", "away"):
+                team_name = str(row[f"{side}_team"] or "").strip()
+                explicit_club = str(row[f"{side}_club"] or "").strip()
+                if not team_name:
+                    continue
+
+                candidate = explicit_club or _derived_club_name(team_name)
+                key = _club_key(candidate)
+                if not key:
+                    continue
+
+                canonical = canonical_by_key.get(key, (1, candidate))[1]
+                team_key = (
+                    team_name,
+                    str(row["series_name"] or ""),
+                    str(row["source_type"] or ""),
+                    str(row["region"] or ""),
+                )
+                teams_by_club.setdefault(canonical, {})[team_key] = {
+                    "team_name": team_name,
+                    "series_name": str(row["series_name"] or ""),
+                    "source_type": str(row["source_type"] or ""),
+                    "region": str(row["region"] or ""),
+                }
+
+        # Include organisers without a participating team as clubs too.
+        all_clubs = {
+            display
+            for _priority, display in canonical_by_key.values()
+        } | set(teams_by_club)
+
+        ordered_clubs = sorted(all_clubs, key=str.casefold)
+        ordered_teams = {
+            club: sorted(
+                teams_by_club.get(club, {}).values(),
+                key=lambda item: (
+                    item["team_name"].casefold(),
+                    item["series_name"].casefold(),
+                ),
+            )
+            for club in ordered_clubs
+        }
+        return ordered_clubs, ordered_teams
+
+    def list_clubs(self, season: str) -> list[str]:
+        """Return the merged, alphabetically sorted club registry."""
+        clubs, _teams = self._club_team_index(season)
+        return clubs
+
+    def list_teams_for_club(
+        self,
+        season: str,
+        club: str,
+    ) -> list[dict[str, str]]:
+        """Return the teams and series belonging to one merged club."""
+        _clubs, teams = self._club_team_index(season)
+        return teams.get(club, [])
+
 
     def query_matches(
         self,
