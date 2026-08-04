@@ -523,6 +523,148 @@ class Database:
         return teams.get(club, [])
 
 
+    def list_club_team_names(self, season: str, club: str) -> list[str]:
+        """Return unique team names belonging to a club in one season."""
+        return sorted(
+            {
+                str(row["team_name"])
+                for row in self.list_teams_for_club(season, club)
+                if row.get("team_name")
+            },
+            key=str.casefold,
+        )
+
+    def list_club_months(self, season: str, club: str) -> list[int]:
+        """
+        Return months in which the club's teams have matches.
+
+        The order follows the playing season: July through June.
+        """
+        team_names = self.list_club_team_names(season, club)
+        if not team_names:
+            return []
+
+        placeholders = ", ".join("?" for _ in team_names)
+        parameters: list[object] = [season, *team_names, *team_names]
+
+        rows = self.connection.execute(
+            f"""
+            SELECT DISTINCT
+                CAST(substr(match_date, 6, 2) AS INTEGER) AS month_number
+            FROM matches
+            WHERE season = ?
+              AND (
+                    home_team IN ({placeholders})
+                 OR away_team IN ({placeholders})
+              )
+              AND length(match_date) = 10
+            ORDER BY
+                CASE
+                    WHEN CAST(substr(match_date, 6, 2) AS INTEGER) >= 7
+                        THEN CAST(substr(match_date, 6, 2) AS INTEGER) - 6
+                    ELSE CAST(substr(match_date, 6, 2) AS INTEGER) + 6
+                END
+            """,
+            parameters,
+        )
+
+        return [
+            int(row["month_number"])
+            for row in rows
+            if 1 <= int(row["month_number"]) <= 12
+        ]
+
+    @staticmethod
+    def organiser_matches_club(organiser: str, club: str) -> bool:
+        """
+        Return whether an organiser name represents the selected club.
+
+        Full normalized names are preferred. A shared non-empty core name is
+        accepted for variants such as "Backa BTK" and
+        "Backa Bordtennisklubb".
+        """
+        organiser = _clean_club_source_name(organiser)
+        club = _clean_club_source_name(club)
+
+        if not organiser or not club:
+            return False
+
+        if _club_key(organiser) == _club_key(club):
+            return True
+
+        organiser_core = _club_core_key(organiser)
+        club_core = _club_core_key(club)
+        return bool(organiser_core and organiser_core == club_core)
+
+
+    def query_club_matches(
+        self,
+        season: str,
+        club: str,
+        *,
+        month: int | None = None,
+        team_name: str = "",
+    ) -> list[sqlite3.Row]:
+        """
+        Return matches involving any team in the selected club.
+
+        A concrete team filter restricts the result to that team. Otherwise
+        every team belonging to the club is included.
+        """
+        all_team_names = self.list_club_team_names(season, club)
+        if not all_team_names:
+            return []
+
+        selected_teams = (
+            [team_name]
+            if team_name and team_name in all_team_names
+            else all_team_names
+        )
+        placeholders = ", ".join("?" for _ in selected_teams)
+
+        clauses = [
+            "season = ?",
+            f"(home_team IN ({placeholders}) OR away_team IN ({placeholders}))",
+        ]
+        parameters: list[object] = [
+            season,
+            *selected_teams,
+            *selected_teams,
+        ]
+
+        if month is not None:
+            clauses.append("substr(match_date, 6, 2) = ?")
+            parameters.append(f"{month:02d}")
+
+        return list(
+            self.connection.execute(
+                f"""
+                SELECT
+                    match_date,
+                    match_time,
+                    series_name,
+                    round_name,
+                    home_team,
+                    away_team,
+                    organiser,
+                    score,
+                    region,
+                    source_url
+                FROM matches
+                WHERE {' AND '.join(clauses)}
+                ORDER BY
+                    match_date,
+                    match_time,
+                    series_name,
+                    round_name,
+                    home_team,
+                    away_team
+                """,
+                parameters,
+            )
+        )
+
+
     def query_matches(
         self,
         organiser: str = "",

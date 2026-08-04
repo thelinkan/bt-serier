@@ -5,9 +5,11 @@ import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal, Qt, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -127,6 +129,18 @@ class MainWindow(QMainWindow):
         ("Region", "region"),
     ]
 
+    CLUB_MATCH_COLUMNS = [
+        ("Datum", "match_date"),
+        ("Tid", "match_time"),
+        ("Serie", "series_name"),
+        ("Omgång", "round_name"),
+        ("Hemma", "home_team"),
+        ("Borta", "away_team"),
+        ("Arrangör", "organiser"),
+        ("Resultat", "score"),
+        ("Region", "region"),
+    ]
+
     SUMMARY_COLUMNS = [
         ("Datum", "match_date"),
         ("Serie", "series_name"),
@@ -168,6 +182,7 @@ class MainWindow(QMainWindow):
 
     def _create_source_pages_tab(self) -> QWidget:
         self.source_table = QTableWidget()
+        self.source_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.source_table.setColumnCount(len(self.SOURCE_COLUMNS))
         self.source_table.setHorizontalHeaderLabels([label for label, _ in self.SOURCE_COLUMNS])
         self.source_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -269,6 +284,7 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(export_button)
 
         self.matches_table = QTableWidget()
+        self.matches_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.matches_table.setColumnCount(len(self.MATCH_COLUMNS))
         self.matches_table.setHorizontalHeaderLabels([label for label, _ in self.MATCH_COLUMNS])
         self.matches_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -277,6 +293,7 @@ class MainWindow(QMainWindow):
         self.matches_table.cellDoubleClicked.connect(self.open_source_url)
 
         self.summary_table = QTableWidget()
+        self.summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.summary_table.setColumnCount(len(self.SUMMARY_COLUMNS))
         self.summary_table.setHorizontalHeaderLabels([label for label, _ in self.SUMMARY_COLUMNS])
         self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -305,7 +322,11 @@ class MainWindow(QMainWindow):
             self.on_selected_club_changed
         )
 
+        self.selected_club_label = QLabel("Välj en förening")
+
+        # Lagläge
         self.club_team_table = QTableWidget()
+        self.club_team_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.club_team_table.setColumnCount(len(self.TEAM_COLUMNS))
         self.club_team_table.setHorizontalHeaderLabels(
             [label for label, _ in self.TEAM_COLUMNS]
@@ -316,6 +337,64 @@ class MainWindow(QMainWindow):
         self.club_team_table.horizontalHeader().setStretchLastSection(True)
         self.club_team_table.setSortingEnabled(True)
 
+        teams_widget = QWidget()
+        teams_layout = QVBoxLayout(teams_widget)
+        teams_layout.addWidget(self.club_team_table, 1)
+
+        # Matchläge
+        self.club_match_filter_type = QComboBox()
+        self.club_match_filter_type.addItem("Filtrera på månad", "month")
+        self.club_match_filter_type.addItem("Filtrera på lag", "team")
+        self.club_match_filter_type.currentIndexChanged.connect(
+            self.refresh_club_match_filter_values
+        )
+
+        self.club_match_filter_value = QComboBox()
+        self.club_match_filter_value.currentIndexChanged.connect(
+            self.refresh_club_matches
+        )
+
+        self.highlight_organised_matches = QCheckBox(
+            "Markera matcher som föreningen arrangerar"
+        )
+        self.highlight_organised_matches.toggled.connect(
+            self.refresh_club_matches
+        )
+
+        match_filter_row = QHBoxLayout()
+        match_filter_row.addWidget(QLabel("Filter:"))
+        match_filter_row.addWidget(self.club_match_filter_type)
+        match_filter_row.addWidget(self.club_match_filter_value, 1)
+        match_filter_row.addWidget(self.highlight_organised_matches)
+        match_filter_row.addStretch(1)
+
+        self.club_match_table = QTableWidget()
+        self.club_match_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.club_match_table.setColumnCount(len(self.CLUB_MATCH_COLUMNS))
+        self.club_match_table.setHorizontalHeaderLabels(
+            [label for label, _ in self.CLUB_MATCH_COLUMNS]
+        )
+        self.club_match_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self.club_match_table.horizontalHeader().setStretchLastSection(True)
+        self.club_match_table.setSortingEnabled(True)
+        self.club_match_table.cellDoubleClicked.connect(
+            self.open_club_match_source_url
+        )
+
+        matches_widget = QWidget()
+        matches_layout = QVBoxLayout(matches_widget)
+        matches_layout.addLayout(match_filter_row)
+        matches_layout.addWidget(self.club_match_table, 1)
+
+        self.club_detail_tabs = QTabWidget()
+        self.club_detail_tabs.addTab(teams_widget, "Lag")
+        self.club_detail_tabs.addTab(matches_widget, "Matcher")
+        self.club_detail_tabs.currentChanged.connect(
+            self.refresh_selected_club
+        )
+
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.addWidget(QLabel("Säsong:"))
@@ -325,9 +404,8 @@ class MainWindow(QMainWindow):
 
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
-        self.selected_club_label = QLabel("Välj en förening")
         right_layout.addWidget(self.selected_club_label)
-        right_layout.addWidget(self.club_team_table, 1)
+        right_layout.addWidget(self.club_detail_tabs, 1)
 
         splitter = QSplitter()
         splitter.addWidget(left_widget)
@@ -566,17 +644,26 @@ class MainWindow(QMainWindow):
     def on_selected_club_changed(self, _current=None, _previous=None) -> None:
         self.refresh_selected_club()
 
-    def refresh_selected_club(self) -> None:
-        if not hasattr(self, "club_team_table"):
-            return
-
+    def current_club_context(self) -> tuple[str, str]:
         season = str(self.club_season_filter.currentData() or "")
         item = self.club_list.currentItem()
         club = item.text() if item else ""
+        return season, club
+
+    def refresh_selected_club(self, _index=None) -> None:
+        if not hasattr(self, "club_team_table"):
+            return
+
+        season, club = self.current_club_context()
 
         if not season:
             self.selected_club_label.setText("Ingen importerad säsong finns")
             self._fill_table(self.club_team_table, [], self.TEAM_COLUMNS)
+            self._fill_table(
+                self.club_match_table,
+                [],
+                self.CLUB_MATCH_COLUMNS,
+            )
             return
 
         if not club:
@@ -584,11 +671,155 @@ class MainWindow(QMainWindow):
                 f"Inga föreningar finns för säsongen {season}"
             )
             self._fill_table(self.club_team_table, [], self.TEAM_COLUMNS)
+            self._fill_table(
+                self.club_match_table,
+                [],
+                self.CLUB_MATCH_COLUMNS,
+            )
             return
 
         self.selected_club_label.setText(f"{club} – säsong {season}")
-        rows = self.database.list_teams_for_club(season, club)
-        self._fill_table(self.club_team_table, rows, self.TEAM_COLUMNS)
+
+        team_rows = self.database.list_teams_for_club(season, club)
+        self._fill_table(
+            self.club_team_table,
+            team_rows,
+            self.TEAM_COLUMNS,
+        )
+
+        self.refresh_club_match_filter_values()
+
+    def refresh_club_match_filter_values(self, _index=None) -> None:
+        if not hasattr(self, "club_match_filter_value"):
+            return
+
+        season, club = self.current_club_context()
+        filter_type = str(
+            self.club_match_filter_type.currentData() or "month"
+        )
+        previous = self.club_match_filter_value.currentData()
+
+        month_names = {
+            1: "Januari",
+            2: "Februari",
+            3: "Mars",
+            4: "April",
+            5: "Maj",
+            6: "Juni",
+            7: "Juli",
+            8: "Augusti",
+            9: "September",
+            10: "Oktober",
+            11: "November",
+            12: "December",
+        }
+
+        self.club_match_filter_value.blockSignals(True)
+        self.club_match_filter_value.clear()
+
+        if filter_type == "month":
+            self.club_match_filter_value.addItem("Alla månader", None)
+            if season and club:
+                for month_number in self.database.list_club_months(
+                    season,
+                    club,
+                ):
+                    self.club_match_filter_value.addItem(
+                        month_names[month_number],
+                        month_number,
+                    )
+        else:
+            self.club_match_filter_value.addItem("Alla lag", "")
+            if season and club:
+                for team_name in self.database.list_club_team_names(
+                    season,
+                    club,
+                ):
+                    self.club_match_filter_value.addItem(
+                        team_name,
+                        team_name,
+                    )
+
+        selected_index = self.club_match_filter_value.findData(previous)
+        self.club_match_filter_value.setCurrentIndex(
+            selected_index if selected_index >= 0 else 0
+        )
+        self.club_match_filter_value.blockSignals(False)
+        self.refresh_club_matches()
+
+    def refresh_club_matches(self, _index=None) -> None:
+        if not hasattr(self, "club_match_table"):
+            return
+
+        season, club = self.current_club_context()
+        if not season or not club:
+            self._fill_table(
+                self.club_match_table,
+                [],
+                self.CLUB_MATCH_COLUMNS,
+            )
+            return
+
+        filter_type = str(
+            self.club_match_filter_type.currentData() or "month"
+        )
+        value = self.club_match_filter_value.currentData()
+
+        month = value if filter_type == "month" else None
+        team_name = str(value or "") if filter_type == "team" else ""
+
+        rows = self.database.query_club_matches(
+            season,
+            club,
+            month=month,
+            team_name=team_name,
+        )
+        self._fill_club_match_table(rows, club)
+
+    def _fill_club_match_table(self, rows, club: str) -> None:
+        """
+        Fill the club match table and optionally highlight rows arranged by
+        the selected club.
+        """
+        highlight = self.highlight_organised_matches.isChecked()
+
+        self.club_match_table.setSortingEnabled(False)
+        self.club_match_table.setRowCount(len(rows))
+
+        for row_index, row in enumerate(rows):
+            arranged_by_club = self.database.organiser_matches_club(
+                str(row["organiser"] or ""),
+                club,
+            )
+
+            for column_index, (_, field) in enumerate(
+                self.CLUB_MATCH_COLUMNS
+            ):
+                item = QTableWidgetItem(str(row[field] or ""))
+                item.setData(Qt.UserRole, row["source_url"])
+
+                if highlight and arranged_by_club:
+                    item.setBackground(QColor(255, 244, 184))
+                    font = QFont(item.font())
+                    font.setBold(True)
+                    item.setFont(font)
+
+                self.club_match_table.setItem(
+                    row_index,
+                    column_index,
+                    item,
+                )
+
+        self.club_match_table.setSortingEnabled(True)
+        self.club_match_table.resizeRowsToContents()
+
+    def open_club_match_source_url(self, row: int, _column: int) -> None:
+        item = self.club_match_table.item(row, 0)
+        if item and item.data(Qt.UserRole):
+            QDesktopServices.openUrl(
+                QUrl(str(item.data(Qt.UserRole)))
+            )
+
 
     def refresh_filter_options(self) -> None:
         """Refresh season and month choices while preserving selections."""
